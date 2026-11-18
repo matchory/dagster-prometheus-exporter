@@ -4,6 +4,7 @@ query GetAssetsLatestInfo($assetKeys: [AssetKeyInput!]!) {
       path
     }
     latestRun {
+      runId
       status
       endTime
     }

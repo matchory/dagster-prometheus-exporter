@@ -171,7 +171,7 @@ Full label reference, edge cases, and design rationale for every metric below: [
 | `dagster_sensor_last_tick_status` | Gauge | Outcome of a sensor's most recent tick. |
 | `dagster_sensor_last_tick_timestamp_seconds` | Gauge | When a sensor last ticked, so a stalled evaluation loop is detectable. |
 | `dagster_asset_stale_status` | Gauge | Whether an asset's data is missing, stale, or fresh. |
-| `dagster_asset_last_materialization_status` | Gauge | Outcome of an asset's most recently launched materializing run — the only one of the two that shows a failed run, since staleness alone can't tell "failed" from "never run". |
+| `dagster_asset_last_materialization_status` | Gauge | Outcome of an asset's most recently launched materializing run, read from the asset's own steps when the run failed or was canceled — the only one of the two that shows a failed run, since staleness alone can't tell "failed" from "never run". |
 | `dagster_asset_last_materialization_timestamp_seconds` | Gauge | When an asset was last materialized, regardless of outcome — catches a leaf asset that's gone quiet, since stale status alone can't (it's a `code_version` comparison, not elapsed time). |
 | `dagster_asset_check_status` | Gauge | Outcome of an asset check's latest execution (`succeeded`, `failed`, `execution_failed`, ...) with its severity, so a check that fails while the run succeeds can alert. |
 | `dagster_asset_metadata_value` | Gauge | A numeric metadata value (a row count, a score) an asset recorded on its latest materialization, for the assets and labels listed in `ASSET_METADATA_VALUES`. No series unless it is set. |

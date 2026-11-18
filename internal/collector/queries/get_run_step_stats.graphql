@@ -1,0 +1,20 @@
+query GetRunStepStats($runIds: [String]) {
+  runsOrError(filter: { runIds: $runIds }) {
+    __typename
+    ... on Runs {
+      results {
+        runId
+        stepStats {
+          stepKey
+          status
+        }
+      }
+    }
+    ... on PythonError {
+      message
+    }
+    ... on InvalidPipelineRunsFilterError {
+      message
+    }
+  }
+}

@@ -261,6 +261,8 @@ Labels: `asset_key`, `status`
 
 Always `1`; status of an asset's most recently launched materializing run (`assetsLatestInfo.latestRun.status`, e.g. `success`, `failure`, `started`). No series at all for an asset that has never had a run.
 
+A run's status is not always its assets' outcome: declarative automation launches many assets in one `__ASSET_JOB` run, and one failed step fails the run. So when the latest run failed or was canceled, the exporter reads that run's steps (`runsOrError` by run ID, `stepStats`, one query for all such runs) and reports `success` for an asset whose own steps all succeeded. An asset's steps are those of its ops (`assetNodes.opNames`; a dynamically mapped step's key adds `[mapping key]`). An asset with no step in the run (the run stopped before it started, or its op was renamed since) keeps the run's status, and so does every asset when that query fails.
+
 This exists because `dagster_asset_stale_status` can't answer "did the last run succeed": `assetMaterializations` (and the `staleStatus` derived from it) only records successful events, so a failing asset and one that has simply never run both look `missing` there. This metric reads the run itself instead, so a failed run is visible even though it left the asset's materialization history untouched.
 
 ## `dagster_asset_last_materialization_timestamp_seconds` (Gauge)

@@ -2,6 +2,7 @@ package collector
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,6 +23,13 @@ import (
 // both from a single /graphql URL.
 func assetStatusServer(t *testing.T, nodesBody, latestInfoBody string) *httptest.Server {
 	t.Helper()
+	return assetStatusServerWithSteps(t, nodesBody, latestInfoBody, `{"data": {"runsOrError": {"__typename": "Runs", "results": []}}}`)
+}
+
+// assetStatusServerWithSteps also answers the third query
+// (get_run_step_stats.graphql), sent for failed and canceled runs.
+func assetStatusServerWithSteps(t *testing.T, nodesBody, latestInfoBody, stepStatsBody string) *httptest.Server {
+	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req GraphQLRequest
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
@@ -35,6 +43,9 @@ func assetStatusServer(t *testing.T, nodesBody, latestInfoBody string) *httptest
 			require.NoError(t, err)
 		case strings.Contains(req.Query, "assetsLatestInfo"):
 			_, err := w.Write([]byte(latestInfoBody))
+			require.NoError(t, err)
+		case strings.Contains(req.Query, "runsOrError"):
+			_, err := w.Write([]byte(stepStatsBody))
 			require.NoError(t, err)
 		default:
 			t.Fatalf("unexpected query: %s", req.Query)
@@ -329,6 +340,9 @@ func TestCollectAssetStatusWithStaleStatusDisabledDoesNotAskForIt(t *testing.T) 
 		if strings.Contains(req.Query, "assetsLatestInfo") {
 			body = `{"data":{"assetsLatestInfo":[{"assetKey":{"path":["plain_asset"]},"latestRun":{"status":"FAILURE","endTime":100}}]}}`
 		}
+		if strings.Contains(req.Query, "runsOrError") {
+			body = `{"data":{"runsOrError":{"__typename":"Runs","results":[]}}}`
+		}
 		_, err := w.Write([]byte(body))
 		require.NoError(t, err)
 	}))
@@ -338,11 +352,110 @@ func TestCollectAssetStatusWithStaleStatusDisabledDoesNotAskForIt(t *testing.T) 
 
 	require.NoError(t, CollectAssetStatus(t.Context(), c))
 
-	require.Len(t, queries, 2)
+	require.Len(t, queries, 3, "asset nodes, latest runs, and the failed run's steps")
 	assert.NotContains(t, queries[0], "staleStatus", "the query that makes Dagster compute it must not be sent")
 	assert.Contains(t, queries[0], "GetAssetKeys")
 	entry := c.assetStatus["plain_asset"]
 	assert.Equal(t, "", entry.staleStatus)
 	assert.Equal(t, "FAILURE", entry.lastMaterializationStatus, "the run-based metrics are unaffected")
 	assert.True(t, entry.hasLastMaterializationTimestamp)
+}
+
+// TestCollectAssetStatusReportsAnAssetBySteps covers a run that several
+// assets shared (declarative automation launches them together): one failed
+// step fails the run, but only the asset whose step failed reports FAILURE.
+// The run's steps are asked for once, however many assets it ran.
+func TestCollectAssetStatusReportsAnAssetBySteps(t *testing.T) {
+	nodesBody := `{
+		"data": {
+			"assetNodes": [
+				{"assetKey": {"path": ["fine"]}, "opNames": ["fine"]},
+				{"assetKey": {"path": ["broken"]}, "opNames": ["broken"]},
+				{"assetKey": {"path": ["mapped"]}, "opNames": ["graph.mapped"]},
+				{"assetKey": {"path": ["half_mapped"]}, "opNames": ["half_mapped"]},
+				{"assetKey": {"path": ["not_started"]}, "opNames": ["not_started"]},
+				{"assetKey": {"path": ["cancelled_after_its_step"]}, "opNames": ["cancelled_after_its_step"]}
+			]
+		}
+	}`
+	latestInfoBody := `{
+		"data": {
+			"assetsLatestInfo": [
+				{"assetKey": {"path": ["fine"]}, "latestRun": {"runId": "shared", "status": "FAILURE", "endTime": 100}},
+				{"assetKey": {"path": ["broken"]}, "latestRun": {"runId": "shared", "status": "FAILURE", "endTime": 100}},
+				{"assetKey": {"path": ["mapped"]}, "latestRun": {"runId": "shared", "status": "FAILURE", "endTime": 100}},
+				{"assetKey": {"path": ["half_mapped"]}, "latestRun": {"runId": "shared", "status": "FAILURE", "endTime": 100}},
+				{"assetKey": {"path": ["not_started"]}, "latestRun": {"runId": "shared", "status": "FAILURE", "endTime": 100}},
+				{"assetKey": {"path": ["cancelled_after_its_step"]}, "latestRun": {"runId": "cancelled", "status": "CANCELED", "endTime": 200}}
+			]
+		}
+	}`
+	stepStatsBody := `{
+		"data": {
+			"runsOrError": {
+				"__typename": "Runs",
+				"results": [
+					{"runId": "shared", "stepStats": [
+						{"stepKey": "fine", "status": "SUCCESS"},
+						{"stepKey": "broken", "status": "FAILURE"},
+						{"stepKey": "graph.mapped[a]", "status": "SUCCESS"},
+						{"stepKey": "graph.mapped[b]", "status": "SUCCESS"},
+						{"stepKey": "half_mapped[a]", "status": "SUCCESS"},
+						{"stepKey": "half_mapped[b]", "status": "FAILURE"},
+						{"stepKey": "fine_but_another_op", "status": "FAILURE"}
+					]},
+					{"runId": "cancelled", "stepStats": [
+						{"stepKey": "cancelled_after_its_step", "status": "SUCCESS"}
+					]}
+				]
+			}
+		}
+	}`
+	var stepQueries []map[string]interface{}
+	inner := assetStatusServerWithSteps(t, nodesBody, latestInfoBody, stepStatsBody)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req GraphQLRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		if strings.Contains(req.Query, "runsOrError") {
+			stepQueries = append(stepQueries, req.Variables)
+		}
+		body, err := json.Marshal(req)
+		require.NoError(t, err)
+		resp, err := http.Post(inner.URL, "application/json", strings.NewReader(string(body)))
+		require.NoError(t, err)
+		defer func() { require.NoError(t, resp.Body.Close()) }()
+		w.Header().Set("Content-Type", "application/json")
+		_, err = io.Copy(w, resp.Body)
+		require.NoError(t, err)
+	}))
+	t.Cleanup(ts.Close)
+	c := NewDagsterCollector(t.Context(), ts.URL, "", time.Hour, time.Hour, 500, 5*time.Minute)
+
+	require.NoError(t, CollectAssetStatus(t.Context(), c))
+
+	require.Len(t, stepQueries, 1)
+	assert.ElementsMatch(t, []interface{}{"cancelled", "shared"}, stepQueries[0]["runIds"])
+	status := func(key string) string { return c.assetStatus[key].lastMaterializationStatus }
+	assert.Equal(t, "SUCCESS", status("fine"), "its own step succeeded; another asset's step failed the run")
+	assert.Equal(t, "FAILURE", status("broken"))
+	assert.Equal(t, "SUCCESS", status("mapped"), "every mapped step of a graph-backed op succeeded")
+	assert.Equal(t, "FAILURE", status("half_mapped"), "one of its mapped steps failed")
+	assert.Equal(t, "FAILURE", status("not_started"), "no step of its own in the run: the run's status")
+	assert.Equal(t, "SUCCESS", status("cancelled_after_its_step"))
+	assert.Equal(t, 100.0, c.assetStatus["fine"].lastMaterializationTimestamp, "the end time is still the run's")
+}
+
+// TestCollectAssetStatusFallsBackToTheRunWhenItsStepsCannotBeRead checks
+// that a failing step query costs only the refinement: the assets keep
+// their runs' statuses and the scrape succeeds.
+func TestCollectAssetStatusFallsBackToTheRunWhenItsStepsCannotBeRead(t *testing.T) {
+	nodesBody := `{"data": {"assetNodes": [{"assetKey": {"path": ["fine"]}, "opNames": ["fine"]}]}}`
+	latestInfoBody := `{"data": {"assetsLatestInfo": [{"assetKey": {"path": ["fine"]}, "latestRun": {"runId": "r", "status": "FAILURE", "endTime": 100}}]}}`
+	stepStatsBody := `{"data": {"runsOrError": {"__typename": "PythonError", "message": "boom"}}}`
+	ts := assetStatusServerWithSteps(t, nodesBody, latestInfoBody, stepStatsBody)
+	c := NewDagsterCollector(t.Context(), ts.URL, "", time.Hour, time.Hour, 500, 5*time.Minute)
+
+	require.NoError(t, CollectAssetStatus(t.Context(), c))
+
+	assert.Equal(t, "FAILURE", c.assetStatus["fine"].lastMaterializationStatus)
 }

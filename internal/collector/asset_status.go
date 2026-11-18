@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -46,6 +47,14 @@ type assetStatusEntry struct {
 // never run (see issue #56's investigation notes). Only
 // assetsLatestInfo.latestRun.status distinguishes the two, hence the second
 // query.
+//
+// A run's status is not always its assets' outcome, though: declarative
+// automation launches many assets in one run, and one failed step fails the
+// whole run. So for the failed and canceled runs among the latest runs, a
+// third query reads their steps (runsOrError by run ID, stepStats), and an
+// asset whose own steps (opNames) all succeeded reports SUCCESS. An asset
+// with no step in the run (never started, or a renamed op) keeps the run's
+// status.
 func CollectAssetStatus(ctx context.Context, c *DagsterCollector) error {
 	nodesReq := getAssetNodesRequest(!c.assetStaleStatusDisabled)
 	nodesResp, err := getAssetNodes(ctx, nodesReq, c.client)
@@ -56,7 +65,9 @@ func CollectAssetStatus(ctx context.Context, c *DagsterCollector) error {
 
 	entries := make(map[string]assetStatusEntry, len(nodesResp.Data.AssetNodes))
 	assetKeys := make([]AssetKeyPath, 0, len(nodesResp.Data.AssetNodes))
+	opNames := make(map[string][]string, len(nodesResp.Data.AssetNodes))
 	for _, node := range nodesResp.Data.AssetNodes {
+		opNames[assetKeyLabel(node.AssetKey.Path)] = node.OpNames
 		var entry assetStatusEntry
 		// Dagster answers a partitioned asset's staleStatus with FRESH when no
 		// partition is given, whatever its partitions' state is. Emitting
@@ -88,6 +99,16 @@ func CollectAssetStatus(ctx context.Context, c *DagsterCollector) error {
 			return err
 		}
 
+		// The failed and canceled latest runs, each asked for once however
+		// many assets it ran.
+		unsuccessfulRuns := map[string]bool{}
+		for _, info := range infoResp.Data.AssetsLatestInfo {
+			if info.LatestRun != nil && isUnsuccessfulRunStatus(info.LatestRun.Status) {
+				unsuccessfulRuns[info.LatestRun.RunID] = true
+			}
+		}
+		steps := runSteps(ctx, c, unsuccessfulRuns)
+
 		for _, info := range infoResp.Data.AssetsLatestInfo {
 			if info.LatestRun == nil {
 				continue
@@ -95,6 +116,9 @@ func CollectAssetStatus(ctx context.Context, c *DagsterCollector) error {
 			key := assetKeyLabel(info.AssetKey.Path)
 			entry := entries[key]
 			entry.lastMaterializationStatus = info.LatestRun.Status
+			if isUnsuccessfulRunStatus(info.LatestRun.Status) && ownStepsSucceeded(steps[info.LatestRun.RunID], opNames[key]) {
+				entry.lastMaterializationStatus = "SUCCESS"
+			}
 			if info.LatestRun.EndTime != nil {
 				entry.lastMaterializationTimestamp = *info.LatestRun.EndTime
 				entry.hasLastMaterializationTimestamp = true
@@ -112,6 +136,57 @@ func CollectAssetStatus(ctx context.Context, c *DagsterCollector) error {
 	c.assetStatus = entries
 
 	return nil
+}
+
+func isUnsuccessfulRunStatus(status string) bool {
+	return status == "FAILURE" || status == "CANCELED"
+}
+
+// runSteps answers each run's step outcomes by step key. When the query
+// fails, it logs and answers none, so every asset keeps its run's status:
+// the refinement is lost for one scrape, the run-based metric is not.
+func runSteps(ctx context.Context, c *DagsterCollector, runIDs map[string]bool) map[string]map[string]string {
+	steps := map[string]map[string]string{}
+	if len(runIDs) == 0 {
+		return steps
+	}
+	ids := make([]string, 0, len(runIDs))
+	for id := range runIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	resp, err := getRunStepStats(ctx, getRunStepStatsRequest(ids), c.client)
+	if err != nil {
+		log.Printf("failed to collect the steps of failed runs from dagster, asset statuses fall back to their runs': %v", err)
+		return steps
+	}
+	for _, run := range resp.Data.RunsOrError.Results {
+		byKey := make(map[string]string, len(run.StepStats))
+		for _, step := range run.StepStats {
+			byKey[step.StepKey] = step.Status
+		}
+		steps[run.RunID] = byKey
+	}
+	return steps
+}
+
+// ownStepsSucceeded reports whether the run has at least one step of the
+// asset's ops and all of them succeeded. A step's key is its op's node
+// handle, with "[mapping key]" appended for a dynamically mapped step.
+func ownStepsSucceeded(steps map[string]string, opNames []string) bool {
+	found := false
+	for stepKey, status := range steps {
+		for _, op := range opNames {
+			if stepKey != op && !strings.HasPrefix(stepKey, op+"[") {
+				continue
+			}
+			if status != "SUCCESS" {
+				return false
+			}
+			found = true
+		}
+	}
+	return found
 }
 
 // assetKeyLabel joins an asset key's path segments into a single Prometheus

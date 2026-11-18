@@ -626,14 +626,18 @@ type AssetKeyPath []string
 // staleStatus is nullable in the schema (an asset can have no computable
 // staleness, e.g. one with no defined freshness policy or partitions
 // Dagster hasn't evaluated yet), hence the pointer.
+//
+// opNames are the node handles of the ops that compute the asset ("op", or
+// "graph.op" for a graph-backed asset): the step keys of its steps in a run.
 type GraphQLAssetNodesResponse struct {
 	Data struct {
 		AssetNodes []struct {
 			AssetKey struct {
 				Path AssetKeyPath `json:"path"`
 			} `json:"assetKey"`
-			IsPartitioned bool    `json:"isPartitioned"`
-			StaleStatus   *string `json:"staleStatus"`
+			OpNames       []string `json:"opNames"`
+			IsPartitioned bool     `json:"isPartitioned"`
+			StaleStatus   *string  `json:"staleStatus"`
 		} `json:"assetNodes"`
 	} `json:"data"`
 	graphQLErrors
@@ -683,6 +687,7 @@ type GraphQLAssetsLatestInfoResponse struct {
 				Path AssetKeyPath `json:"path"`
 			} `json:"assetKey"`
 			LatestRun *struct {
+				RunID  string `json:"runId"`
 				Status string `json:"status"`
 				// EndTime is null while the run is still in progress
 				// (issue #156), so it can't be a plain float64: that would
@@ -721,6 +726,48 @@ func getAssetsLatestInfo(ctx context.Context, request *GraphQLRequest, client da
 	var resp GraphQLAssetsLatestInfoResponse
 	if err := doGraphQL(ctx, request, client, &resp); err != nil {
 		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// GraphQLRunStepStatsResponse is the shape of runsOrError filtered by run
+// IDs, asking only for each run's steps and their outcome. CollectAssetStatus
+// sends it for the failed and canceled runs among the assets' latest runs.
+type GraphQLRunStepStatsResponse struct {
+	Data struct {
+		RunsOrError struct {
+			Typename string `json:"__typename"`
+			Results  []struct {
+				RunID     string `json:"runId"`
+				StepStats []struct {
+					StepKey string `json:"stepKey"`
+					Status  string `json:"status"`
+				} `json:"stepStats"`
+			} `json:"results"`
+			Message string `json:"message"`
+		} `json:"runsOrError"`
+	} `json:"data"`
+	graphQLErrors
+}
+
+//go:embed queries/get_run_step_stats.graphql
+var runStepStatsQuery string
+
+func getRunStepStatsRequest(runIDs []string) *GraphQLRequest {
+	return &GraphQLRequest{
+		Query:     runStepStatsQuery,
+		Variables: map[string]interface{}{"runIds": runIDs},
+	}
+}
+
+func getRunStepStats(ctx context.Context, request *GraphQLRequest, client dagsterClient) (*GraphQLRunStepStatsResponse, error) {
+	var resp GraphQLRunStepStatsResponse
+	if err := doGraphQL(ctx, request, client, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Data.RunsOrError.Typename != "Runs" {
+		return nil, fmt.Errorf("runsOrError answered %s: %s", resp.Data.RunsOrError.Typename, resp.Data.RunsOrError.Message)
 	}
 
 	return &resp, nil

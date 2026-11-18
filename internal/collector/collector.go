@@ -269,7 +269,7 @@ func NewDagsterCollector(ctx context.Context, dagsterGraphQLEndpoint string, dag
 		),
 		assetLastMaterializationStatusDesc: prometheus.NewDesc(
 			"dagster_asset_last_materialization_status",
-			"Status of an asset's most recent materializing run (value is always 1; status is carried in the status label). Absent for an asset that has never had a run — unlike stale status, this is derived from the run itself rather than assetMaterializations, so a run that fails before producing a materialization still shows up here (see docs/metrics.md)",
+			"Status of an asset's most recent materializing run (value is always 1; status is carried in the status label). Absent for an asset that has never had a run — unlike stale status, this is derived from the run itself rather than assetMaterializations, so a run that fails before producing a materialization still shows up here. In a failed or canceled run, an asset whose own steps all succeeded reports success (see docs/metrics.md)",
 			[]string{"asset_key", "status"},
 			nil,
 		),

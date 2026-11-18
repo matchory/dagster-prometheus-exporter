@@ -3,5 +3,6 @@ query GetAssetKeys {
     assetKey {
       path
     }
+    opNames
   }
 }
